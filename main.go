@@ -93,7 +93,6 @@ func patchNodeAnnotations(k8sClient *kubernetes.Clientset, keys []string) {
 	}
 	logger = logger.With().Str("public_ip", ip).Logger()
 
-	ip = time.Now().String()
 	patchSet := PatchSet{}
 	for _, key := range keys {
 		// sanitize key name (see http://jsonpatch.com)
