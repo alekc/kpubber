@@ -88,7 +88,10 @@ func patchNodeAnnotations(k8sClient *kubernetes.Clientset, keys []string) {
 	ctx := context.Background()
 	ip, err := publicip.Get()
 	if err != nil {
-		logger.Err(err).Msg("cannot obtain public ip, skipping update phase")
+		logger.
+			Err(err).
+			Msg("cannot obtain public ip")
+		os.Exit(1)
 		return
 	}
 	logger = logger.With().Str("public_ip", ip).Logger()
