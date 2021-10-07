@@ -52,7 +52,6 @@ jobs:
         uses: crazy-max/ghaction-docker-meta@v1
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tag-sha: true
           tag-semver: |
             v{{version}}
             v{{major}}.x
