@@ -14,11 +14,13 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/viper"
 	"go.alekc.dev/publicip"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	coreV1 "k8s.io/api/core/v1"
+	metaV1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/cloud-provider/node/helpers"
 )
 
 const fieldManagerName = "k8s.alekc.dev/kpubber"
@@ -29,6 +31,12 @@ const ConfigNodeName = "NODE_NAME"
 const ConfigAnnotations = "KEYS"
 const ConfigCron = "CRON"
 const ConfigCronDisable = "CRON_DISABLE"
+const ConfigSetExternalIP = "SET_EXTERNAL_IP"
+
+const (
+	ExitCodeCannotObtainIP = 1
+	ExitCannotFindNode     = 2
+)
 
 type Patch struct {
 	Op    string      `json:"op"`
@@ -91,7 +99,7 @@ func patchNodeAnnotations(k8sClient *kubernetes.Clientset, keys []string) {
 		logger.
 			Err(err).
 			Msg("cannot obtain public ip")
-		os.Exit(1)
+		os.Exit(ExitCodeCannotObtainIP)
 		return
 	}
 	logger = logger.With().Str("public_ip", ip).Logger()
@@ -110,7 +118,7 @@ func patchNodeAnnotations(k8sClient *kubernetes.Clientset, keys []string) {
 		})
 	}
 	_, err = k8sClient.CoreV1().Nodes().Patch(ctx, nodeName, types.JSONPatchType, patchSet.JSON(),
-		v1.PatchOptions{
+		metaV1.PatchOptions{
 			FieldManager: fieldManagerName,
 		})
 	if err != nil {
@@ -119,54 +127,82 @@ func patchNodeAnnotations(k8sClient *kubernetes.Clientset, keys []string) {
 			Msg("cannot patch the node annotations")
 		return
 	}
-	logger.Debug().Msg("patched")
+	logger.Debug().Msg("patched annotations")
+	if viper.GetBool(ConfigSetExternalIP) {
+		setExternalIP(logger.WithContext(ctx), nodeName, k8sClient, ip)
+	}
 }
 
-// it has some curious side effect. For now I leave it disabled for next release
-// func setExternalIP(ctx context.Context,node *coreV1.Node, k8sClient *kubernetes.Clientset, ip string) {
-// 	newNode := node.DeepCopy()
-// 	found := false
-// 	for k,v := range newNode.Status.Addresses{
-// 		if v.Type != coreV1.NodeExternalIP {
-// 			continue
-// 		}
-// 		// we found it, so let's set it up
-// 		newNode.Status.Addresses[k].Address = ip
-// 		found = true
-// 		break
-// 	}
-// 	// if we have not found the entry with node external ip, lets set it from here
-// 	if !found {
-// 		newNode.Status.Addresses = append(newNode.Status.Addresses,coreV1.NodeAddress{
-// 			Type:    coreV1.NodeExternalIP,
-// 			Address: ip,
-// 		})
-// 	}
-// 	//
-// 	// data := nodePatch{Status: nodeStatusPatch{
-// 	// 	Addresses: node.Status.Addresses,
-// 	// }}
-// 	// patchContent, err := json.Marshal(data)
-// 	// if err != nil {
-// 	// 	log.Err(err).Msg("cannot marshal patch")
-// 	// 	return
-// 	// }
-//
-// 	status, err := k8sClient.CoreV1().Nodes().PatchStatus(ctx,newNode.Name,patchContent)
-// 	if err != nil {
-// 		fmt.Println(status)
-// 		return
-// 	}
-// 	// _, err := k8sClient.CoreV1().Nodes(). UpdateStatus(ctx, newNode,v1.UpdateOptions{
-// 	// 	FieldManager: fieldManagerName,
-// 	// })
-// 	// if err != nil {
-// 	// 	log.Err(err).
-// 	// 		Msg("cannot update node's status")
-// 	// 	return
-// 	// }
-//
-// }
+// Sadly we need to implement a cloud controller by the looks of it, because when addresses are patched kubelet will
+// revert them on the next update.
+func setExternalIP(ctx context.Context, nodeName string, k8sClient *kubernetes.Clientset, ip string) {
+	logger := log.Ctx(ctx)
+	node, err := k8sClient.CoreV1().Nodes().Get(ctx, nodeName, metaV1.GetOptions{})
+	if err != nil {
+		logger.Err(err).Msg("could not find the node")
+		os.Exit(ExitCannotFindNode)
+	}
+
+	found := false
+	addresses := node.Status.Addresses
+	for k, v := range addresses {
+		if v.Type != coreV1.NodeExternalIP {
+			continue
+		}
+		// we found it. check if there is anything we need to do
+		if addresses[k].Address == ip {
+			log.Info().Msg("node's external ip is already set to it's public ip. skipping update")
+			return
+		}
+		addresses[k].Address = ip
+		found = true
+		break
+	}
+
+	// if we have not found the entry with node external ip, lets set it from here
+	if !found {
+		addresses = append(addresses, coreV1.NodeAddress{
+			Type:    coreV1.NodeExternalIP,
+			Address: ip,
+		})
+	}
+	// sadly, since the addresses are not properly indexed, we have to apply the complete replace patch
+
+	// node.Status.Addresses = addresses
+	// _, err = k8sClient.CoreV1().Nodes().UpdateStatus(ctx, node, metaV1.UpdateOptions{
+	// 	FieldManager: fieldManagerName,
+	// })
+	// if err != nil {
+	// 	return
+	// }
+
+	// patchSet := PatchSet{{
+	// 	Op:    "replace",
+	// 	Path:  "/status/addresses",
+	// 	Value: addresses,
+	// }}
+	// payload := patchSet.JSON()
+
+	// _, err = k8sClient.CoreV1().Nodes().PatchStatus(ctx, node.Name, payload)
+
+	newNode := node.DeepCopy()
+	newNode.Status.Addresses = addresses
+	xx, _, err := helpers.PatchNodeStatus(k8sClient.CoreV1(), types.NodeName(nodeName), node, newNode)
+	if err != nil {
+		fmt.Println(xx)
+		return
+	}
+
+	// _, err = k8sClient.CoreV1().Nodes().Patch(ctx, node.Name, types.JSONPatchType, patchSet.JSON(),
+	// 	metaV1.PatchOptions{
+	// 		FieldManager: fieldManagerName,
+	// 	})
+	// if err != nil {
+	// 	logger.Err(err).Msg("cannot patch node's external ip")
+	// 	return
+	// }
+	logger.Info().Msg("patched node's externalIP")
+}
 
 func loadK8sClient() *kubernetes.Clientset {
 	var config *rest.Config
@@ -208,4 +244,5 @@ func loadConfig() {
 	viper.SetDefault(ConfigUseKubeConfig, false)
 	viper.SetDefault(ConfigKubeConfigPath, filepath.Join(os.Getenv("HOME"), ".kube", "config"))
 	viper.SetDefault(ConfigCron, "@every 5m")
+	viper.SetDefault(ConfigSetExternalIP, false)
 }
